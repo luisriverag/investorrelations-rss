@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(HERE, ".cache")
 EDGAR_CACHE = os.path.join(CACHE_DIR, "edgar")
 WIRE_CACHE = os.path.join(CACHE_DIR, "wires")
+IR_CACHE = os.path.join(CACHE_DIR, "ir")
 
 SEC_UA = "SP500-IR-Research/1.0 (research; contact: ir-research@example.com)"
 BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -121,6 +122,21 @@ def plain_get(url, timeout=25, retries=1):
             if attempt < retries:
                 time.sleep(0.5)
     return None
+
+
+def http_text(url, timeout=15):
+    """GET a URL, falling back to curl_cffi TLS impersonation on block (403/None).
+
+    Many IR sites sit behind Cloudflare and return 403 to plain requests but
+    serve fine to a browser-impersonating client.
+    """
+    r = plain_get(url, timeout=timeout)
+    if r is not None and r.status_code < 400:
+        return r
+    rc = cf_get(url, timeout=timeout, retries=0)
+    if rc is not None and rc.status_code < 400:
+        return rc
+    return r if r is not None else rc
 
 
 # --------------------------------------------------------------------------- #
@@ -385,12 +401,38 @@ def google_news(name, limit=40):
     if r is None or r.status_code != 200:
         return url, []
     parsed = feedparser.parse(r.content)
-    items = [{
+    return url, [{
         "source": "google_news", "title": e.get("title"),
         "url": e.get("link"), "published": e.get("published"),
         "text": None,
     } for e in parsed.entries[:limit]]
-    return url, items
+
+
+YAHOO_NEWS = "https://finance.yahoo.com/rss/headline?s={t}"
+BING_NEWS = "https://www.bing.com/news/search?q={q}&format=RSS"
+
+
+def _rss_items(url, source, limit=40, use_cf=False):
+    r = cf_get(url) if use_cf else plain_get(url)
+    if r is None or r.status_code != 200:
+        return []
+    parsed = feedparser.parse(r.content)
+    return [{
+        "source": source, "title": e.get("title"), "url": e.get("link"),
+        "published": e.get("published"), "text": None,
+    } for e in parsed.entries[:limit]]
+
+
+def yahoo_finance_rss(ticker, limit=20):
+    """Yahoo Finance per-symbol headline RSS (works for the whole universe)."""
+    url = YAHOO_NEWS.format(t=urllib.parse.quote(ticker))
+    return url, _rss_items(url, "yahoo_news", limit, use_cf=True)
+
+
+def bing_news(name, limit=20):
+    """Bing News per-company RSS (independent secondary news source)."""
+    url = BING_NEWS.format(q=urllib.parse.quote(f'"{name}"'))
+    return url, _rss_items(url, "bing_news", limit, use_cf=True)
 
 
 def _cf_page(url, cache=True):
@@ -518,12 +560,28 @@ def wire_news(name):
 # --------------------------------------------------------------------------- #
 IR_SUBDOMAINS = ["investor", "investors", "ir"]
 IR_PATHS = ["/investors", "/investor-relations", "/investor", "/ir",
-            "/about/investors", "/company/investors", "/corporate/investors",
-            "/en/investors"]
-COMMON_FEED_PATHS = ["/rss", "/feed", "/feed.xml", "/rss.xml", "/atom.xml",
-                     "/news/rss", "/news/feed", "/press-releases/rss",
-                     "/press-releases/feed", "/rss/news", "/rss/press-releases",
-                     "/news-events/press-releases/rss", "/en/rss"]
+            "/about/investors", "/about-us/investors", "/company/investors",
+            "/corporate/investors", "/en/investors", "/en/investor-relations",
+            "/investors-relations", "/investor-relations/overview",
+            "/news-events", "/press-releases", "/media/press-releases"]
+COMMON_FEED_PATHS = [
+    "/rss", "/feed", "/feed.xml", "/rss.xml", "/atom.xml", "/index.xml",
+    "/rss/news", "/rss/press-releases", "/rss/pressreleases",
+    "/rss/news-releases", "/news/rss", "/news/feed", "/news/rss.xml",
+    "/news/feed.xml", "/press-releases/rss", "/press-releases/feed",
+    "/press-releases/rss.xml", "/press-releases/feed.xml",
+    "/press/press-releases/rss", "/news-events/press-releases/rss",
+    "/news-events/press-releases/rss.xml", "/media/press-releases/rss",
+    "/en/rss", "/en/news/rss", "/blog/feed", "/feed/rss", "/?feed=rss2",
+    # Q4 Inc IR platform + Nasdaq IR / common CMS endpoints
+    "/feed/PressRelease.aspx", "/rss/pressrelease.aspx",
+    "/rss/PressRelease.aspx", "/feed/press-releases", "/feed/default.aspx",
+    "/rss/News.aspx", "/rss/news.aspx",
+]
+SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/news-sitemap.xml",
+                 "/sitemap/news.xml", "/press-releases/sitemap.xml"]
+NEWS_HINT = re.compile(r"news|press|release|media|announce", re.I)
+PRESS_SUB_RE = re.compile(r"press|news|media|releases", re.I)
 IR_URL_RE = re.compile(r"(^|\.)(investor|investors|ir)\.|"
                        r"/(investor|investors|ir)(-?relations)?(/|$)", re.I)
 
@@ -564,7 +622,7 @@ def _extract_feeds(html, base):
 
 
 def _validate_feed(url):
-    r = plain_get(url, timeout=15)
+    r = http_text(url, timeout=15)
     if r is None or r.status_code != 200:
         return None
     head = r.content[:400].lstrip().lower()
@@ -580,20 +638,81 @@ def _validate_feed(url):
     return None
 
 
-def discover_ir(website):
-    """Return {ir_page, feed_url, feed_title, feed_entries}."""
-    out = {"ir_page": None, "feed_url": None, "feed_title": None,
-           "feed_entries": None}
+def _press_sublinks(html, base):
+    """Absolute links on a page whose text/href looks like news/press."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    out, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith(("mailto:", "javascript:", "#")):
+            continue
+        if PRESS_SUB_RE.search((a.get_text(" ", strip=True) or "") + " " + href):
+            u = urljoin(base, href)
+            if u.startswith("http") and u not in seen:
+                seen.add(u)
+                out.append(u)
+    return out
+
+
+def _find_press_sitemap(base):
+    """Return a sitemap URL that appears to list news/press pages, else None."""
+    u = urlparse(base)
+    root = f"{u.scheme}://{u.netloc}"
+    for p in SITEMAP_PATHS:
+        url = root + p
+        r = http_text(url, timeout=10)
+        if r is None or r.status_code != 200:
+            continue
+        text = r.text
+        head = text[:1000]
+        if "<sitemapindex" in head:
+            for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", text):
+                if NEWS_HINT.search(loc):
+                    return loc
+            continue
+        if "<urlset" in head or "<url " in head:
+            if NEWS_HINT.search(p) or NEWS_HINT.search(text[:10000]):
+                return url
+    return None
+
+
+def discover_ir(website, deep=True, budget=15.0, use_cache=True):
+    """Return {ir_page, feed_url, feed_title, feed_entries, press_sitemap}.
+
+    Results are cached per-domain in ``.cache/ir/`` so re-runs are instant.
+    A wall-clock ``budget`` (seconds) bounds the work per company.
+    """
     dom = _domain(website)
     if not dom:
-        return out
+        return {"ir_page": None, "feed_url": None, "feed_title": None,
+                "feed_entries": None, "press_sitemap": None}
+    cache_path = os.path.join(IR_CACHE, dom.replace(":", "_") + ".json")
+    if use_cache:
+        cached = _read_json(cache_path)
+        if cached is not None:
+            return cached
+    res = _discover_ir_uncached(website, dom, deep, budget)
+    if use_cache:
+        _write_json(cache_path, res)
+    return res
+
+
+def _discover_ir_uncached(website, dom, deep, budget):
+    out = {"ir_page": None, "feed_url": None, "feed_title": None,
+           "feed_entries": None, "press_sitemap": None}
+    deadline = time.time() + budget
     root = dom.split(":")[0]
     bases = [f"https://{s}.{root}" for s in IR_SUBDOMAINS] + \
             [f"https://www.{root}{p}" for p in IR_PATHS] + \
             [f"https://{root}{p}" for p in IR_PATHS]
     page_html = None
-    for base in bases[:8]:
-        r = plain_get(base, timeout=10)
+    for base in bases[:6]:
+        if time.time() > deadline:
+            break
+        r = http_text(base, timeout=8)
         if r is None or r.status_code != 200:
             continue
         ctype = (r.headers.get("Content-Type") or "html").lower()
@@ -604,12 +723,23 @@ def discover_ir(website):
             break
     if not out["ir_page"]:
         return out
+
     cands = _extract_feeds(page_html, out["ir_page"])
+    # Follow press/news subpages that may advertise their own feed.
+    if deep and page_html and time.time() < deadline:
+        for sub in _press_sublinks(page_html, out["ir_page"])[:2]:
+            if time.time() > deadline:
+                break
+            r = http_text(sub, timeout=8)
+            if r is None or r.status_code != 200:
+                continue
+            cands.extend(_extract_feeds(r.text, r.url))
     for p in COMMON_FEED_PATHS:
         cands.append(out["ir_page"].rstrip("/") + p)
+
     seen = set()
     for u in cands:
-        if u in seen:
+        if u in seen or time.time() > deadline:
             continue
         seen.add(u)
         v = _validate_feed(u)
@@ -617,4 +747,8 @@ def discover_ir(website):
             out.update(feed_url=u, feed_title=v["title"],
                        feed_entries=v["entries"])
             break
+    # No native feed: fall back to a press/news sitemap (still enumerates
+    # press releases, and is consumable by most feed tooling).
+    if not out["feed_url"] and deep and time.time() < deadline:
+        out["press_sitemap"] = _find_press_sitemap(out["ir_page"])
     return out

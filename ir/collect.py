@@ -5,7 +5,7 @@ Stages:
     yahoo       - sector/industry/website via yfinance (cached)
     ir_rss      - IR website landing page + native RSS feed
     edgar       - filings, earnings 8-K press-release full text, Atom feed
-    news        - Google News RSS items
+    news        - Google News + Bing News + Yahoo Finance per-company RSS
     wires       - GlobeNewswire / PR Newswire / Business Wire press releases
     financials  - XBRL quarterly revenue / net income / EPS
 
@@ -97,7 +97,7 @@ def seed_from_prior(con):
     n = 0
     with open(SP500_CSV, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            t = row["ticker"]
+            t = str(row["ticker"]).strip().upper().replace(".", "-")
             db.upsert_company(con, t, name=row.get("yahoo_name") or row.get("name"),
                               sector=row.get("yahoo_sector") or row.get("sector"),
                               industry=row.get("yahoo_industry"),
@@ -156,8 +156,13 @@ def stage_ir_rss(con, comps, workers, force):
             if res["feed_url"]:
                 db.upsert_feed(con, c["ticker"], "ir_rss", res["feed_url"],
                                res["feed_title"], res["feed_entries"], verified=1)
+            if res.get("press_sitemap"):
+                db.upsert_feed(con, c["ticker"], "press_sitemap",
+                               res["press_sitemap"], "press sitemap", None,
+                               verified=1)
             db.set_sync(con, c["ticker"], "ir_rss",
-                        "ok" if res["feed_url"] else "empty")
+                        "ok" if (res["feed_url"] or res.get("press_sitemap"))
+                        else "empty")
             con.commit()
         return bool(res["feed_url"])
 
@@ -210,16 +215,24 @@ def stage_news(con, comps, workers, force):
 
     def work(c):
         name = c.get("name") or c["ticker"]
-        url, items = sources.google_news(name)
+        ticker = c["ticker"]
+        gurl, git = sources.google_news(name)
+        burl, bit = sources.bing_news(name)
+        yurl, yit = sources.yahoo_finance_rss(ticker)
+        all_items = git + bit + yit
         with DB_LOCK:
-            if items:
-                db.insert_press_releases(con, c["ticker"], items)
-            db.upsert_feed(con, c["ticker"], "google_news", url,
-                           entries=len(items), verified=1 if items else 0)
-            db.set_sync(con, c["ticker"], "news",
-                        "ok" if items else "empty")
+            if all_items:
+                db.insert_press_releases(con, ticker, all_items)
+            db.upsert_feed(con, ticker, "google_news", gurl,
+                           entries=len(git), verified=1 if git else 0)
+            db.upsert_feed(con, ticker, "bing_news", burl,
+                           entries=len(bit), verified=1 if bit else 0)
+            db.upsert_feed(con, ticker, "yahoo_news", yurl,
+                           entries=len(yit), verified=1 if yit else 0)
+            db.set_sync(con, ticker, "news",
+                        "ok" if all_items else "empty")
             con.commit()
-        return bool(items)
+        return bool(all_items)
 
     _pool(todo, work, workers, "news")
 
@@ -284,6 +297,8 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--no-earnings-text", action="store_true")
     ap.add_argument("--include-etfs", action="store_true")
+    ap.add_argument("--no-export", action="store_true",
+                    help="skip refreshing output/ticker_feeds.csv at the end")
     args = ap.parse_args()
 
     con = db.connect()
@@ -333,6 +348,11 @@ def main():
                not args.no_earnings_text)
         else:
             fn(con, cs, args.workers, args.force)
+
+    if not args.no_export:
+        from .export import export_feeds
+        path, n = export_feeds()
+        sources.log(f"[export] {n} rows -> {os.path.relpath(path, HERE)}")
 
     sources.log("[done]")
 

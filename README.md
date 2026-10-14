@@ -138,7 +138,7 @@ data from every viable source, and serves it through a Flask website.
 | `filings` | recent SEC filings (10-K/10-Q/8-K/DEF 14A/...) with `is_earnings` flag |
 | `press_releases` | `google_news`, `prnewswire`, `globenewswire`, and full-text `edgar_8k` earnings releases |
 | `metrics` | financials from XBRL: revenue, gross/operating/net income, diluted EPS — US-GAAP (`10-Q`/`10-K`) with automatic **IFRS (`ifrs-full:`) fallback for foreign 20-F/40-F/6-K filers** (home currency preserved) |
-| `feeds` | discovered feeds (IR native RSS, EDGAR Atom, Google News) with verification |
+| `feeds` | discovered feeds (IR native RSS, EDGAR Atom, Google/Bing News, Yahoo Finance, press sitemap) with verification |
 | `sync` | per-company/per-stage status → runs are **resumable** and skip completed work |
 
 ## Collector
@@ -180,15 +180,28 @@ Stages: `yahoo, ir_rss, edgar, news, wires, financials`. Everything is cached
 
 `export_feeds.py` writes a diff-friendly `output/ticker_feeds.csv` mapping every
 ticker to its discovered feeds (one column per feed kind, verified feeds only).
-This file is committed to the repo so consumers can grab it directly:
+This file is committed to the repo so consumers can grab it directly, and it is
+**refreshed automatically at the end of every `collect` run** (disable with
+`--no-export`):
 
 ```bash
 .venv/bin/python export_feeds.py            # -> output/ticker_feeds.csv
 ./run.sh feeds
 ```
 
-Columns: `ticker, name, exchange, in_sp500, edgar_atom, google_news, ir_rss`
-(extra feed kinds appear automatically as new columns).
+Columns: `ticker, name, exchange, in_sp500, ir_rss, edgar_atom, google_news,
+bing_news, yahoo_news, press_sitemap` (extra feed kinds appear automatically).
+
+## Feed sources
+
+| Kind | Source | Coverage |
+|------|--------|----------|
+| `edgar_atom` | SEC EDGAR per-company 8-K Atom feed | every filer with a CIK |
+| `google_news` | Google News RSS search | whole universe |
+| `bing_news` | Bing News RSS search | whole universe |
+| `yahoo_news` | Yahoo Finance per-symbol headline RSS | whole universe |
+| `ir_rss` | Native IR-site RSS/Atom (HTML autodiscovery, subpage scan, ~30 common paths, Q4/Nasdaq-IR endpoints, TLS-impersonation for Cloudflare sites) | companies with a discoverable IR site |
+| `press_sitemap` | IR/`news` sitemap fallback when no RSS exists | IR sites without RSS |
 
 ## Notes / limitations
 
