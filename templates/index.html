@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Companies &middot; IR Explorer{% endblock %}
+{% block content %}
+<form class="filters" method="get" action="{{ url_for('index') }}">
+  <input type="search" name="q" value="{{ q }}" placeholder="Ticker or company name">
+  <select name="exchange">
+    <option value="">All exchanges</option>
+    {% for ex in exchanges %}
+      <option value="{{ ex }}" {% if ex == exchange %}selected{% endif %}>{{ ex }}</option>
+    {% endfor %}
+  </select>
+  <label><input type="checkbox" name="sp500" value="1" {% if only_sp500 %}checked{% endif %}> S&amp;P 500</label>
+  <label><input type="checkbox" name="rss" value="1" {% if only_rss %}checked{% endif %}> Has IR RSS</label>
+  <button type="submit">Filter</button>
+</form>
+
+<p class="muted">{{ total }} companies &middot; page {{ page }} of {{ pages }}</p>
+
+<table class="grid">
+  <thead>
+    <tr><th>Ticker</th><th>Name</th><th>Exchange</th><th>Sector</th>
+        <th class="r">Filings</th><th class="r">PRs</th><th>IR RSS</th></tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a class="tick" href="{{ url_for('company', ticker=r['ticker']) }}">{{ r['ticker'] }}</a>
+          {% if r['in_sp500'] %}<span class="badge">S&amp;P</span>{% endif %}</td>
+      <td>{{ r['name'] }}</td>
+      <td>{{ r['exchange'] or '' }}</td>
+      <td>{{ r['sector'] or '' }}</td>
+      <td class="r">{{ r['filing_count'] or 0 }}</td>
+      <td class="r">{{ r['pr_count'] or 0 }}</td>
+      <td>{% if r['ir_rss'] %}<a href="{{ r['ir_rss'] }}">feed</a>{% else %}<span class="muted">—</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if pages > 1 %}
+<div class="pager">
+  {% set args = {'q': q, 'exchange': exchange, 'sp500': '1' if only_sp500 else '', 'rss': '1' if only_rss else ''} %}
+  {% if page > 1 %}
+    <a href="{{ url_for('index', page=page-1, **args) }}">&laquo; Prev</a>
+  {% endif %}
+  <span>Page {{ page }} / {{ pages }}</span>
+  {% if page < pages %}
+    <a href="{{ url_for('index', page=page+1, **args) }}">Next &raquo;</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}IR Explorer{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <a class="brand" href="{{ url_for('index') }}">IR&nbsp;Explorer</a>
+      <nav>
+        <a href="{{ url_for('index') }}">Companies</a>
+        <a href="{{ url_for('stats') }}">Stats</a>
+        <a href="{{ url_for('api_companies') }}">API</a>
+      </nav>
+    </div>
+  </header>
+  <main class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="wrap">
+    <span>US-listed IR dataset &middot; SEC EDGAR + XBRL + Google News + newswire</span>
+  </footer>
+</body>
+</html>

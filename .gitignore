@@ -1,0 +1,22 @@
+# Caches (downloaded HTML/JSON, breakout tickets)
+.cache/
+wires/
+
+# Runtime data
+output/ir.db
+output/ir.db-*
+output/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Logs / editor / OS
+*.log
+.DS_Store
+.idea/
+.vscode/

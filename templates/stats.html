@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Stats &middot; IR Explorer{% endblock %}
+{% block content %}
+<h1>Dataset Stats</h1>
+<div class="cards">
+  <div class="card"><div class="num">{{ s.companies }}</div><div class="lbl">Companies</div></div>
+  <div class="card"><div class="num">{{ s.sp500 }}</div><div class="lbl">S&amp;P 500</div></div>
+  <div class="card"><div class="num">{{ s.companies_with_filings }}</div><div class="lbl">With filings</div></div>
+  <div class="card"><div class="num">{{ s.press_releases }}</div><div class="lbl">Press releases</div></div>
+  <div class="card"><div class="num">{{ s.earnings_texts }}</div><div class="lbl">Earnings texts</div></div>
+  <div class="card"><div class="num">{{ s.metric_rows }}</div><div class="lbl">Metric rows</div></div>
+  <div class="card"><div class="num">{{ s.ir_rss }}</div><div class="lbl">IR RSS feeds</div></div>
+  <div class="card"><div class="num">{{ s.google_news }}</div><div class="lbl">News feeds</div></div>
+</div>
+
+<section>
+  <h2>Press releases by source</h2>
+  <table class="grid">
+    <thead><tr><th>Source</th><th class="r">Count</th></tr></thead>
+    <tbody>
+    {% for r in sources %}
+      <tr><td>{{ r['source'] }}</td><td class="r">{{ r['c'] }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

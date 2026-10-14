@@ -1,0 +1,571 @@
+"""
+Source collectors: SEC EDGAR, XBRL financials, Google News, wire services
+(Business Wire / PR Newswire / GlobeNewswire via curl_cffi), and IR-site RSS.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+import hashlib
+import threading
+import datetime
+import warnings
+import urllib.parse
+from urllib.parse import urljoin, urlparse
+
+import requests
+import feedparser
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from curl_cffi import requests as cq
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_DIR = os.path.join(HERE, ".cache")
+EDGAR_CACHE = os.path.join(CACHE_DIR, "edgar")
+WIRE_CACHE = os.path.join(CACHE_DIR, "wires")
+
+SEC_UA = "SP500-IR-Research/1.0 (research; contact: ir-research@example.com)"
+BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+SEC = requests.Session()
+SEC.headers.update({"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"})
+
+_print_lock = threading.Lock()
+
+
+def log(msg):
+    with _print_lock:
+        print(msg, flush=True)
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
+SEC_MIN_INTERVAL = 0.25
+_sec_lock = threading.Lock()
+_sec_last = [0.0]
+
+
+def _sec_throttle():
+    with _sec_lock:
+        wait = SEC_MIN_INTERVAL - (time.monotonic() - _sec_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _sec_last[0] = time.monotonic()
+
+
+def sec_get(url, timeout=30, retries=5):
+    r = None
+    for attempt in range(retries + 1):
+        _sec_throttle()
+        try:
+            r = SEC.get(url, timeout=timeout, allow_redirects=True)
+        except requests.RequestException:
+            r = None
+        if r is not None and r.status_code == 429:
+            ra = r.headers.get("Retry-After")
+            delay = float(ra) if (ra and ra.replace(".", "").isdigit()) \
+                else min(60.0, 3.0 * (attempt + 1))
+            log(f"      429 SEC {url.split('/')[2]}, backoff {delay:.0f}s")
+            time.sleep(delay)
+            continue
+        if r is not None:
+            return r
+        time.sleep(1.0 * (attempt + 1))
+    return r
+
+
+def cf_get(url, timeout=30, retries=2, impersonate="chrome"):
+    """curl_cffi GET with browser TLS impersonation (for wires/news sites)."""
+    r = None
+    for attempt in range(retries + 1):
+        try:
+            r = cq.get(url, impersonate=impersonate, timeout=timeout,
+                       allow_redirects=True)
+        except Exception:
+            r = None
+        if r is not None and r.status_code < 400:
+            return r
+        if attempt < retries:
+            time.sleep(0.8 * (attempt + 1))
+    return r
+
+
+def plain_get(url, timeout=25, retries=1):
+    for attempt in range(retries + 1):
+        try:
+            return requests.get(url, headers={"User-Agent": BROWSER_UA},
+                                timeout=timeout, allow_redirects=True)
+        except requests.RequestException:
+            if attempt < retries:
+                time.sleep(0.5)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# SEC EDGAR
+# --------------------------------------------------------------------------- #
+def edgar_submissions(cik):
+    os.makedirs(EDGAR_CACHE, exist_ok=True)
+    path = os.path.join(EDGAR_CACHE, f"{cik}.json")
+    cached = _read_json(path)
+    if cached is not None:
+        return cached
+    r = sec_get(f"https://data.sec.gov/submissions/CIK{cik}.json")
+    if r is None or r.status_code != 200:
+        return None
+    return r.json()
+
+
+def _filing_url(cik, accession, doc):
+    return (f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+            f"{accession.replace('-', '')}/{doc}")
+
+
+FORMS_OF_INTEREST = {"10-K", "10-Q", "8-K", "DEF 14A", "20-F", "6-K", "S-1",
+                     "424B4", "DEFA14A", "SC 13D", "SC 13G"}
+
+
+def build_filings(cik, max_filings=120):
+    data = edgar_submissions(cik)
+    if not data:
+        return None, None
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    reports = recent.get("reportDate", [])
+    accs = recent.get("accessionNumber", [])
+    docs = recent.get("primaryDocument", [])
+    items = recent.get("items", [""] * len(forms))
+
+    filings = []
+    latest = {}
+    earnings_acc = None
+    for i, form in enumerate(forms):
+        if form not in FORMS_OF_INTEREST:
+            continue
+        acc = accs[i]
+        url = _filing_url(cik, acc, docs[i]) if docs[i] else \
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-','')}/"
+        is_earn = 1 if (form == "8-K" and "2.02" in (items[i] or "")) else 0
+        filings.append({
+            "form": form, "filing_date": dates[i], "report_date": reports[i],
+            "accession": acc, "url": url, "items": items[i] or "",
+            "is_earnings": is_earn,
+        })
+        if form not in latest:
+            latest[form] = {"date": dates[i], "url": url, "accession": acc}
+        if is_earn and earnings_acc is None:
+            earnings_acc = acc
+        if len(filings) >= max_filings:
+            break
+    return filings, {"latest": latest, "earnings_acc": earnings_acc,
+                     "company": data.get("name"),
+                     "sic": data.get("sicDescription")}
+
+
+def _exhibit_score(name):
+    low = name.lower()
+    s = 0
+    if "exhibit" in low or re.search(r"ex[-_]?x?9", low):
+        s += 10
+    if "99" in low:
+        s += 5
+    if "release" in low or "press" in low:
+        s += 4
+    if "earnings" in low or "results" in low:
+        s += 2
+    if re.search(r"slide|presentation|supplement|transcript|webcast", low):
+        s -= 6
+    return s
+
+
+def find_exhibit(cik, accession):
+    acc = accession.replace("-", "")
+    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/index.json",
+                timeout=20, retries=3)
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        items = r.json().get("directory", {}).get("item", [])
+    except ValueError:
+        return None
+    best, best_s = None, 0
+    for it in items:
+        name = it.get("name") or ""
+        low = name.lower()
+        if not low.endswith((".htm", ".html", ".txt")):
+            continue
+        if "index" in low or "xbrl" in low or re.fullmatch(r"r\d+\.htm", low):
+            continue
+        s = _exhibit_score(name)
+        if s > best_s:
+            best, best_s = name, s
+    if best:
+        return (f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{best}")
+    return None
+
+
+def fetch_text(url, max_chars=120000):
+    """Download a filing document and return cleaned plain text."""
+    r = sec_get(url, timeout=30, retries=2)
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        soup = BeautifulSoup(r.text, "lxml")
+    except Exception:
+        soup = BeautifulSoup(r.text, "html.parser")
+    for t in soup(["script", "style"]):
+        t.decompose()
+    text = " ".join(soup.get_text(" ").split())
+    return text[:max_chars]
+
+
+# --------------------------------------------------------------------------- #
+# XBRL financials
+# --------------------------------------------------------------------------- #
+REVENUE_TAGS = [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+]
+METRIC_TAGS = {
+    "revenue": REVENUE_TAGS,
+    "net_income": ["NetIncomeLoss", "ProfitLoss"],
+    "eps_diluted": ["EarningsPerShareDiluted"],
+    "gross_profit": ["GrossProfit"],
+    "operating_income": ["OperatingIncomeLoss"],
+}
+
+
+def _to_date(s):
+    try:
+        return datetime.date.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def xbrl_metrics(cik, quarters=8):
+    """Return the most recent quarterly values for key metrics."""
+    r = sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                timeout=60, retries=2)
+    if r is None or r.status_code != 200:
+        return []
+    try:
+        facts = r.json().get("facts", {}).get("us-gaap", {})
+    except ValueError:
+        return []
+    out = []
+    for metric, tags in METRIC_TAGS.items():
+        picked = None
+        for tag in tags:
+            if tag in facts:
+                picked = tag
+                break
+        if not picked:
+            continue
+        units = facts[picked].get("units", {})
+        unit_key = "USD/shares" if "shares" in " ".join(units) else "USD"
+        series = units.get(unit_key) or (list(units.values())[0] if units else [])
+        rows = []
+        for row in series:
+            form = row.get("form")
+            if form not in ("10-Q", "10-K"):
+                continue
+            start, end = _to_date(row.get("start")), _to_date(row.get("end"))
+            if not end:
+                continue
+            dur = (end - start).days if start else None
+            if dur is not None and dur > 100:  # keep quarterly periods only
+                continue
+            rows.append({
+                "period_end": end.isoformat(), "fy": row.get("fy"),
+                "fp": row.get("fp"), "form": form, "value": row.get("val"),
+                "unit": unit_key, "filed": row.get("filed"),
+                "accession": row.get("accn"), "dur": dur,
+            })
+        # newest period first, prefer 10-Q (true quarterly) over derived 10-K
+        rows.sort(key=lambda x: (x["period_end"], x["form"] == "10-Q"),
+                  reverse=True)
+        seen = set()
+        for row in rows:
+            if row["period_end"] in seen:
+                continue
+            seen.add(row["period_end"])
+            row.pop("dur", None)
+            row["metric"] = metric
+            out.append(row)
+            if len(seen) >= quarters:
+                break
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# News / wires
+# --------------------------------------------------------------------------- #
+GOOGLE_NEWS = ("https://news.google.com/rss/search?q={q}"
+               "&hl=en-US&gl=US&ceid=US:en")
+
+
+def google_news(name, limit=40):
+    q = f'"{name}" (press release OR earnings OR dividend OR investor)'
+    url = GOOGLE_NEWS.format(q=urllib.parse.quote(q))
+    r = plain_get(url)
+    if r is None or r.status_code != 200:
+        return url, []
+    parsed = feedparser.parse(r.content)
+    items = [{
+        "source": "google_news", "title": e.get("title"),
+        "url": e.get("link"), "published": e.get("published"),
+        "text": None,
+    } for e in parsed.entries[:limit]]
+    return url, items
+
+
+def _cf_page(url, cache=True):
+    if cache:
+        key = hashlib.md5(url.encode()).hexdigest()
+        path = os.path.join(WIRE_CACHE, key + ".html")
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            pass
+    else:
+        path = None
+    r = cf_get(url)
+    if r is None or r.status_code >= 400:
+        return None
+    if path:
+        os.makedirs(WIRE_CACHE, exist_ok=True)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(r.text)
+        except OSError:
+            pass
+    return r.text
+
+
+def globe_newswire(name, limit=10):
+    """Per-company press releases via GlobeNewswire keyword search."""
+    url = "https://www.globenewswire.com/en/search/keyword/" + \
+        urllib.parse.quote(name)
+    html = _cf_page(url)
+    if not html:
+        return url, []
+    soup = BeautifulSoup(html, "lxml")
+    items, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/news-release/" not in href:
+            continue
+        title = a.get_text(" ", strip=True)
+        if not title:
+            continue
+        full = urljoin("https://www.globenewswire.com", href)
+        if full in seen:
+            continue
+        seen.add(full)
+        items.append({"source": "globenewswire", "title": title, "url": full,
+                      "published": None, "text": None})
+        if len(items) >= limit:
+            break
+    return url, items
+
+
+def pr_newswire(name, limit=10):
+    """Per-company press releases via PR Newswire search."""
+    url = "https://www.prnewswire.com/search/news/?keyword=" + \
+        urllib.parse.quote(name)
+    html = _cf_page(url)
+    if not html:
+        return url, []
+    soup = BeautifulSoup(html, "lxml")
+    items, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "prnewswire.com/news-releases/" not in href and \
+           not href.startswith("/news-releases/"):
+            continue
+        title = a.get_text(" ", strip=True)
+        if len(title) < 15:
+            continue
+        full = urljoin("https://www.prnewswire.com", href)
+        if full in seen:
+            continue
+        seen.add(full)
+        items.append({"source": "prnewswire", "title": title, "url": full,
+                      "published": None, "text": None})
+        if len(items) >= limit:
+            break
+    return url, items
+
+
+def businesswire(name, limit=10):
+    """Business Wire blocks automated access; retained for completeness."""
+    url = "https://www.businesswire.com/portal/site/home/search/?searchTerm=" + \
+        urllib.parse.quote(name)
+    html = _cf_page(url)
+    if not html:
+        return url, []
+    soup = BeautifulSoup(html, "lxml")
+    items, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/news/home/" not in href:
+            continue
+        title = a.get_text(" ", strip=True)
+        full = urljoin("https://www.businesswire.com", href)
+        if not title or full in seen:
+            continue
+        seen.add(full)
+        items.append({"source": "businesswire", "title": title, "url": full,
+                      "published": None, "text": None})
+        if len(items) >= limit:
+            break
+    return url, items
+
+
+def wire_news(name):
+    """Aggregate wire-service press releases across providers.
+
+    Business Wire is omitted: it hard-blocks automated access (HTTP 403) and
+    only wastes a request + retries per company.
+    """
+    items = []
+    for fn in (globe_newswire, pr_newswire):
+        try:
+            _, got = fn(name)
+            items.extend(got)
+        except Exception:
+            pass
+    return items
+
+
+# --------------------------------------------------------------------------- #
+# IR website RSS discovery
+# --------------------------------------------------------------------------- #
+IR_SUBDOMAINS = ["investor", "investors", "ir"]
+IR_PATHS = ["/investors", "/investor-relations", "/investor", "/ir",
+            "/about/investors", "/company/investors", "/corporate/investors",
+            "/en/investors"]
+COMMON_FEED_PATHS = ["/rss", "/feed", "/feed.xml", "/rss.xml", "/atom.xml",
+                     "/news/rss", "/news/feed", "/press-releases/rss",
+                     "/press-releases/feed", "/rss/news", "/rss/press-releases",
+                     "/news-events/press-releases/rss", "/en/rss"]
+IR_URL_RE = re.compile(r"(^|\.)(investor|investors|ir)\.|"
+                       r"/(investor|investors|ir)(-?relations)?(/|$)", re.I)
+
+
+def _domain(website):
+    if not website:
+        return None
+    if not website.startswith(("http://", "https://")):
+        website = "https://" + website
+    host = urlparse(website).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _extract_feeds(html, base):
+    out, seen = [], set()
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    for link in soup.find_all("link", href=True):
+        rel = link.get("rel") or []
+        rel = [r.lower() for r in (rel if isinstance(rel, list) else [rel])]
+        typ = (link.get("type") or "").lower()
+        href = link["href"]
+        if "alternate" in rel and ("rss" in typ or "atom" in typ or
+                                   "rss" in href.lower() or "feed" in href.lower()):
+            u = urljoin(base, href)
+            if u not in seen:
+                seen.add(u); out.append(u)
+    for a in soup.find_all("a", href=True):
+        low = a["href"].lower()
+        if ("rss" in low or "feed" in low) and low.endswith(
+                (".xml", "/rss", "/feed", "rss/", "feed/")):
+            u = urljoin(base, a["href"])
+            if u not in seen:
+                seen.add(u); out.append(u)
+    return out
+
+
+def _validate_feed(url):
+    r = plain_get(url, timeout=15)
+    if r is None or r.status_code != 200:
+        return None
+    head = r.content[:400].lstrip().lower()
+    if not (b"<rss" in head or b"<feed" in head or b"<?xml" in head):
+        return None
+    try:
+        f = feedparser.parse(r.content)
+    except Exception:
+        return None
+    if f.entries or (f.feed and f.feed.get("title")):
+        return {"title": (f.feed.get("title") if f.feed else None),
+                "entries": len(f.entries)}
+    return None
+
+
+def discover_ir(website):
+    """Return {ir_page, feed_url, feed_title, feed_entries}."""
+    out = {"ir_page": None, "feed_url": None, "feed_title": None,
+           "feed_entries": None}
+    dom = _domain(website)
+    if not dom:
+        return out
+    root = dom.split(":")[0]
+    bases = [f"https://{s}.{root}" for s in IR_SUBDOMAINS] + \
+            [f"https://www.{root}{p}" for p in IR_PATHS] + \
+            [f"https://{root}{p}" for p in IR_PATHS]
+    page_html = None
+    for base in bases[:8]:
+        r = plain_get(base, timeout=10)
+        if r is None or r.status_code != 200:
+            continue
+        ctype = (r.headers.get("Content-Type") or "html").lower()
+        if "html" not in ctype:
+            continue
+        page_html, out["ir_page"] = r.text, r.url
+        if IR_URL_RE.search(r.url):
+            break
+    if not out["ir_page"]:
+        return out
+    cands = _extract_feeds(page_html, out["ir_page"])
+    for p in COMMON_FEED_PATHS:
+        cands.append(out["ir_page"].rstrip("/") + p)
+    seen = set()
+    for u in cands:
+        if u in seen:
+            continue
+        seen.add(u)
+        v = _validate_feed(u)
+        if v:
+            out.update(feed_url=u, feed_title=v["title"],
+                       feed_entries=v["entries"])
+            break
+    return out

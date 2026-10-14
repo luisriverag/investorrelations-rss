@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}{{ c['ticker'] }} &middot; IR Explorer{% endblock %}
+{% block content %}
+<div class="company-head">
+  <h1>{{ c['ticker'] }} <span class="muted">— {{ c['name'] }}</span></h1>
+  <div class="meta">
+    {% if c['exchange'] %}<span>{{ c['exchange'] }}</span>{% endif %}
+    {% if c['sector'] %}<span>{{ c['sector'] }}</span>{% endif %}
+    {% if c['industry'] %}<span>{{ c['industry'] }}</span>{% endif %}
+    {% if c['in_sp500'] %}<span class="badge">S&amp;P 500</span>{% endif %}
+  </div>
+  <div class="links">
+    {% if c['ir_website'] %}<a href="{{ c['ir_website'] }}">Website</a>{% endif %}
+    {% if c['ir_page'] %}<a href="{{ c['ir_page'] }}">IR page</a>{% endif %}
+    {% if c['cik'] %}<a href="https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={{ c['cik'] }}">SEC filings</a>{% endif %}
+    <a href="{{ url_for('api_company', ticker=c['ticker']) }}">JSON</a>
+  </div>
+  {% if feeds %}
+  <div class="feeds">
+    <strong>Feeds:</strong>
+    {% for f in feeds %}
+      <span class="chip">{{ f['kind'] }}{% if f['verified'] %} ✓{% endif %}
+        {% if f['kind'] in ('google_news','edgar_atom') %}
+          <a href="{{ f['url'] }}">open</a>
+        {% else %}<a href="{{ f['url'] }}">open</a>{% endif %}
+        {% if f['entries'] %} ({{ f['entries'] }}){% endif %}
+      </span>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+
+{% if metrics and periods %}
+<section>
+  <h2>Financials (XBRL, USD)</h2>
+  <div class="scroll">
+  <table class="grid metrics">
+    <thead>
+      <tr><th>Metric</th>{% for p in periods %}<th class="r">{{ p }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+    {% for metric, by_period in metrics.items() %}
+      <tr>
+        <td>{{ metric }}</td>
+        {% for p in periods %}
+          <td class="r">{{ by_period.get(p, '')|num }}</td>
+        {% endfor %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+<section>
+  <h2>Recent Filings</h2>
+  {% if filings %}
+  <table class="grid">
+    <thead><tr><th>Date</th><th>Form</th><th>Description</th><th>Link</th></tr></thead>
+    <tbody>
+    {% for f in filings %}
+      <tr>
+        <td>{{ f['filing_date'] or '' }}</td>
+        <td>{% if f['is_earnings'] %}<span class="badge">8-K</span>{% else %}{{ f['form'] }}{% endif %}</td>
+        <td>{{ f['title'] or f['description'] or '' }}</td>
+        <td><a href="{{ f['url'] }}">view</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">No filings collected yet.</p>{% endif %}
+</section>
+
+<section>
+  <h2>Press Releases &amp; News</h2>
+  {% if by_source %}
+    {% for source, items in by_source.items() %}
+      <h3 class="src">{{ source }} <span class="muted">({{ items|length }})</span></h3>
+      <ul class="pr-list">
+      {% for p in items %}
+        <li>
+          {% if p['published'] %}<span class="date">{{ p['published'] }}</span>{% endif %}
+          {% if p['url'] %}<a href="{{ p['url'] }}">{{ p['title'] or p['url'] }}</a>
+          {% else %}{{ p['title'] }}{% endif %}
+          {% if p['text'] %}
+            <details><summary>read release</summary><pre>{{ p['text'][:20000] }}</pre></details>
+          {% endif %}
+        </li>
+      {% endfor %}
+      </ul>
+    {% endfor %}
+  {% else %}<p class="muted">No press releases collected yet.</p>{% endif %}
+</section>
+{% endblock %}
