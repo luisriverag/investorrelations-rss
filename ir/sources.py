@@ -245,19 +245,51 @@ def fetch_text(url, max_chars=120000):
 # --------------------------------------------------------------------------- #
 # XBRL financials
 # --------------------------------------------------------------------------- #
-REVENUE_TAGS = [
+US_REVENUE_TAGS = [
     "RevenueFromContractWithCustomerExcludingAssessedTax",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
     "Revenues",
     "SalesRevenueNet",
 ]
-METRIC_TAGS = {
-    "revenue": REVENUE_TAGS,
+US_METRIC_TAGS = {
+    "revenue": US_REVENUE_TAGS,
     "net_income": ["NetIncomeLoss", "ProfitLoss"],
     "eps_diluted": ["EarningsPerShareDiluted"],
     "gross_profit": ["GrossProfit"],
     "operating_income": ["OperatingIncomeLoss"],
 }
+
+# IFRS taxonomy for foreign private issuers (20-F / 40-F / 6-K filers).
+IFRS_METRIC_TAGS = {
+    "revenue": ["Revenue", "RevenueFromContractsWithCustomers",
+                "RevenueFromSaleOfGoods", "RevenueFromRenderingOfServices"],
+    "net_income": ["ProfitLoss", "ProfitLossAttributableToOwnersOfParent"],
+    "eps_diluted": ["DilutedEarningsLossPerShare",
+                    "DilutedEarningsLossPerShareFromContinuingOperations"],
+    "gross_profit": ["GrossProfit"],
+    "operating_income": ["ProfitLossFromOperatingActivities",
+                         "OperatingProfitLoss"],
+}
+
+US_FORMS = ("10-Q", "10-K")
+IFRS_FORMS = ("20-F", "40-F", "6-K")
+
+
+def _pick_unit(units, metric):
+    """Choose the unit key: per-share for EPS, otherwise a currency (USD first)."""
+    keys = list(units)
+    if not keys:
+        return None
+    if metric == "eps_diluted":
+        for k in keys:
+            if "shares" in k:
+                return k
+    if "USD" in units:
+        return "USD"
+    for k in keys:
+        if len(k) == 3 and k.isalpha():
+            return k
+    return keys[0]
 
 
 def _to_date(s):
@@ -267,59 +299,76 @@ def _to_date(s):
         return None
 
 
-def xbrl_metrics(cik, quarters=8):
-    """Return the most recent quarterly values for key metrics."""
-    r = sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
-                timeout=60, retries=2)
-    if r is None or r.status_code != 200:
-        return []
-    try:
-        facts = r.json().get("facts", {}).get("us-gaap", {})
-    except ValueError:
-        return []
+def _extract_metrics(facts, metric_tags, forms, quarters, allow_longer):
     out = []
-    for metric, tags in METRIC_TAGS.items():
-        picked = None
-        for tag in tags:
-            if tag in facts:
-                picked = tag
-                break
+    for metric, tags in metric_tags.items():
+        picked = next((t for t in tags if t in facts), None)
         if not picked:
             continue
         units = facts[picked].get("units", {})
-        unit_key = "USD/shares" if "shares" in " ".join(units) else "USD"
-        series = units.get(unit_key) or (list(units.values())[0] if units else [])
-        rows = []
+        unit_key = _pick_unit(units, metric)
+        if not unit_key:
+            continue
+        series = units.get(unit_key, [])
+        quarterly, longer = [], []
         for row in series:
             form = row.get("form")
-            if form not in ("10-Q", "10-K"):
+            if form not in forms:
                 continue
             start, end = _to_date(row.get("start")), _to_date(row.get("end"))
             if not end:
                 continue
             dur = (end - start).days if start else None
-            if dur is not None and dur > 100:  # keep quarterly periods only
-                continue
-            rows.append({
+            rec = {
                 "period_end": end.isoformat(), "fy": row.get("fy"),
                 "fp": row.get("fp"), "form": form, "value": row.get("val"),
                 "unit": unit_key, "filed": row.get("filed"),
-                "accession": row.get("accn"), "dur": dur,
-            })
-        # newest period first, prefer 10-Q (true quarterly) over derived 10-K
-        rows.sort(key=lambda x: (x["period_end"], x["form"] == "10-Q"),
+                "accession": row.get("accn"),
+            }
+            if dur is None or dur <= 100:          # true quarterly period
+                quarterly.append(rec)
+            elif allow_longer and dur <= 380:       # annual / semi-annual
+                longer.append(rec)
+        rows = quarterly or longer
+        rows.sort(key=lambda x: (x["period_end"], x["form"] in ("10-Q", "6-K")),
                   reverse=True)
         seen = set()
         for row in rows:
             if row["period_end"] in seen:
                 continue
             seen.add(row["period_end"])
-            row.pop("dur", None)
             row["metric"] = metric
             out.append(row)
             if len(seen) >= quarters:
                 break
     return out
+
+
+def xbrl_metrics(cik, quarters=8):
+    """Return the most recent values for key metrics.
+
+    Tries the US-GAAP taxonomy first; if it yields nothing, falls back to the
+    IFRS taxonomy (``ifrs-full``) used by foreign private issuers
+    (20-F/40-F/6-K). For IFRS, annual/semi-annual periods are accepted when no
+    quarterly period exists.
+    """
+    r = sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                timeout=60, retries=2)
+    if r is None or r.status_code != 200:
+        return []
+    try:
+        allfacts = r.json().get("facts", {})
+    except ValueError:
+        return []
+    ug = allfacts.get("us-gaap", {})
+    ifrs = allfacts.get("ifrs-full", {})
+
+    us = _extract_metrics(ug, US_METRIC_TAGS, US_FORMS, quarters,
+                          allow_longer=False)
+    if us:
+        return us
+    return _extract_metrics(ifrs, IFRS_METRIC_TAGS, IFRS_FORMS, quarters,
+                            allow_longer=True)
 
 
 # --------------------------------------------------------------------------- #

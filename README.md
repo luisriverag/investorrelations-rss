@@ -137,7 +137,7 @@ data from every viable source, and serves it through a Flask website.
 | `companies` | ticker, name, CIK, exchange, sector/industry, IR website + IR page, S&P 500 flag |
 | `filings` | recent SEC filings (10-K/10-Q/8-K/DEF 14A/...) with `is_earnings` flag |
 | `press_releases` | `google_news`, `prnewswire`, `globenewswire`, and full-text `edgar_8k` earnings releases |
-| `metrics` | quarterly XBRL financials: revenue, gross/operating/net income, diluted EPS |
+| `metrics` | financials from XBRL: revenue, gross/operating/net income, diluted EPS — US-GAAP (`10-Q`/`10-K`) with automatic **IFRS (`ifrs-full:`) fallback for foreign 20-F/40-F/6-K filers** (home currency preserved) |
 | `feeds` | discovered feeds (IR native RSS, EDGAR Atom, Google News) with verification |
 | `sync` | per-company/per-stage status → runs are **resumable** and skip completed work |
 
