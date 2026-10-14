@@ -13,7 +13,7 @@ from . import sources
 
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+SEC_TICKERS = "https://www.sec.gov/files/company_tickers_exchange.json"
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 NASDAQ_CACHE = os.path.join(sources.CACHE_DIR, "nasdaq")
 
@@ -46,16 +46,29 @@ def _yahoo_symbol(sym: str) -> str:
 
 
 def load_sec_tickers() -> dict:
-    """ticker -> {cik, name} from SEC (all SEC registrants with a ticker)."""
+    """ticker -> {cik, name, exchange} from SEC (all registrants with a ticker).
+
+    Uses ``company_tickers_exchange.json`` so the exchange (Nasdaq/NYSE/OTC/CBOE/
+    TXSE/...) is authoritative and available for the whole universe without
+    scraping exchange websites.
+    """
     r = sources.sec_get(SEC_TICKERS)
     if r is None or r.status_code != 200:
         return {}
+    data = r.json()
+    cols = data.get("fields") or ["cik", "name", "ticker", "exchange"]
     out = {}
-    for v in r.json().values():
-        t = _yahoo_symbol(str(v.get("ticker", "")))
-        if t:
-            out[t] = {"cik": f"{int(v['cik_str']):010d}",
-                      "name": str(v.get("title", "")).strip()}
+    for row in data.get("data", []):
+        rec = dict(zip(cols, row))
+        t = _yahoo_symbol(str(rec.get("ticker", "")))
+        if not t:
+            continue
+        ex = rec.get("exchange")
+        out[t] = {
+            "cik": f"{int(rec['cik']):010d}",
+            "name": str(rec.get("name", "")).strip(),
+            "exchange": str(ex).strip() if ex else None,
+        }
     return out
 
 
@@ -149,7 +162,9 @@ def build_universe(include_etfs: bool = False) -> list:
         c = ensure(t)
         c["name"] = c["name"] or meta["name"]
         c["cik"] = c["cik"] or meta["cik"]
-        c["exchange"] = c["exchange"] or exchange_by_ticker.get(t)
+        # Prefer granular symbol-file labels (NYSE American/Arca), else SEC.
+        c["exchange"] = (exchange_by_ticker.get(t) or meta.get("exchange")
+                         or c["exchange"])
 
     for t, meta in sp.items():
         c = ensure(t)
