@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import time
 
 import requests
 import pandas as pd
@@ -153,7 +154,7 @@ def build_universe(include_etfs: bool = False) -> list:
     for t, meta in sp.items():
         c = ensure(t)
         c.update(name=meta["name"], sector=meta["sector"], cik=meta["cik"],
-                 in_sp500=1, exchange=c["exchange"] or "S&P 500")
+                 in_sp500=1, exchange=c["exchange"] or exchange_by_ticker.get(t))
 
     for t, c in by_ticker.items():
         if not c["cik"] and t in sec:

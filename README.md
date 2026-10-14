@@ -173,8 +173,22 @@ Stages: `yahoo, ir_rss, edgar, news, wires, financials`. Everything is cached
 ## Convenience wrapper
 
 ```bash
-./run.sh collect-sp500 | collect-all | refine-sp500 | web | stats
+./run.sh collect-sp500 | collect-all | refine-sp500 | web | feeds | stats
 ```
+
+## Ticker + feeds CSV
+
+`export_feeds.py` writes a diff-friendly `output/ticker_feeds.csv` mapping every
+ticker to its discovered feeds (one column per feed kind, verified feeds only).
+This file is committed to the repo so consumers can grab it directly:
+
+```bash
+.venv/bin/python export_feeds.py            # -> output/ticker_feeds.csv
+./run.sh feeds
+```
+
+Columns: `ticker, name, exchange, in_sp500, edgar_atom, google_news, ir_rss`
+(extra feed kinds appear automatically as new columns).
 
 ## Notes / limitations
 
